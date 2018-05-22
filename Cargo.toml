@@ -1,0 +1,6 @@
+[package]
+name = "fenix_profile"
+version = "0.1.0"
+authors = ["Grisha Kruglov <gkruglov@mozilla.com>"]
+
+[dependencies]
