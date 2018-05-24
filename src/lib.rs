@@ -8,6 +8,7 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
+#[macro_use(bail)]
 extern crate failure;
 extern crate time;
 
@@ -36,7 +37,6 @@ use std::os::raw::{
 use std::sync::Arc;
 
 use mentat::{
-    Binding,
     Store,
     QueryInputs,
     ValueType,
@@ -91,6 +91,7 @@ impl FenixProfile for Store {
                     .value_type(ValueType::String)
                     .unique(Unique::Value)
                     .index(true)
+                    .fulltext(true)
                     .multival(false)
                     .build()),
 
@@ -117,6 +118,7 @@ impl FenixProfile for Store {
                     .value_type(ValueType::String)
                     .multival(false)
                     .fulltext(true)
+                    .index(true)
                     .build()),
             ],
         })?;
@@ -132,22 +134,19 @@ impl FenixProfile for Store {
         let mut transaction = self.begin_transaction()?;
 
         // Look up 'page' by 'url', and insert it if necessary.
-        let query = r#"[:find ?eid :where [?eid :page/url ?url]"#;
+        let query = r#"[:find ?eid :where [?eid :page/url ?url]]"#;
         // 'url' will be moved later on into an Arc...
         let args = QueryInputs::with_value_sequence(vec![(var!(?url), url.clone().into())]);
-        let res = transaction.q_once(query, args).into_scalar_result()?;
-
-        // 'ok_or_else' for lazy evaluation of err_msg calls.
-        let page_url_a = transaction
-            .get_entid(&kw!(:page/url))
-            .ok_or_else(|| err_msg("expected :page/url"))?;
+        let rows = transaction.q_once(query, args).into_rel_result()?;
+        
         let page_e: TypedValue;
 
-        // 'page' for 'url' exists!
-        if let Some(Binding::Scalar(bound_val)) = res {
-            page_e = bound_val;
-        // ... there's no page for 'url', insert one.
-        } else {
+        if rows.is_empty() {
+            // 'ok_or_else' for lazy evaluation of err_msg calls.
+            let page_url_a = transaction
+                .get_entid(&kw!(:page/url))
+                .ok_or_else(|| err_msg("expected :page/url"))?;
+
             let temp_page_e_name = "page";
             let mut page_builder = TermBuilder::new();
             let page_tempid = page_builder.named_tempid(temp_page_e_name.into()).clone();
@@ -157,8 +156,17 @@ impl FenixProfile for Store {
                 .tempids.get(temp_page_e_name)
                 .ok_or_else(|| err_msg("expected 'page' in tempids"))?
             );
+        } else if rows.row_count() > 1 {
+            bail!(err_msg("got more than single 'page' for 'url'"));
+        } else {
+            // TODO this is just terrible...
+            // all I'm trying to do is get a single value out of what's expected to be a single query result.
+            let res: Vec<_> = rows.into_iter().map(|r| r[0].clone().val()).collect();
+            page_e = res.get(0)
+                .ok_or_else(|| err_msg("expected page_e result"))?.clone()
+                .ok_or_else(|| err_msg("expected page_e result"))?;
         }
-        
+       
         // Finally, insert the visit.
         let mut visit_builder = TermBuilder::new();
         
@@ -222,4 +230,53 @@ pub unsafe extern "C" fn fenix_profile_record_visit(manager: *mut Store, url: *c
     //     .record_visit(url.to_string(), when)
     //     .map_err(|e| e.into())
     //     .into()
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    use mentat::QueryBuilder;
+
+    fn get_initialized_store() -> Store {
+        let mut db = Store::open("test.db").expect("in-memory store");
+        db.initialize().expect("ran initialization");
+        db
+    }
+
+    // TODO This looks terrible :(
+    fn get_all_page_urls(db: &mut Store) -> Vec<TypedValue> {
+        QueryBuilder::new(db, r#"[:find ?url :where [?e :page/url ?url]]"#)
+            .execute_rel().expect("execute")
+            .into_iter()
+            .map(|row| row.get(0).expect("").clone().val().expect("typedvalue")).collect()
+    }
+
+    #[test]
+    fn test_initialization() {
+        get_initialized_store();
+    }
+
+    #[test]
+    fn test_record_visit() {
+        let mut db = get_initialized_store();
+
+        assert_eq!(0, get_all_page_urls(&mut db).len());
+
+        db.record_visit("https://www.mozilla.org".to_string(), Timespec::new(1, 0)).expect("recorded visit");
+
+        // TODO this is also terrible...
+        let urls = get_all_page_urls(&mut db);
+        assert_eq!(urls, vec![TypedValue::String(Arc::new("https://www.mozilla.org".to_string()))]);
+
+        db.record_visit("https://www.mozilla.org".to_string(), Timespec::new(2, 0)).expect("recorded visit");
+        assert_eq!(1, get_all_page_urls(&mut db).len());
+
+        db.record_visit("https://www.example.org".to_string(), Timespec::new(3, 0)).expect("recorded visit");
+        let urls = get_all_page_urls(&mut db);
+        assert_eq!(urls, vec![
+            TypedValue::String(Arc::new("https://www.mozilla.org".to_string())),
+            TypedValue::String(Arc::new("https://www.example.org".to_string())),
+        ]);
+    }
 }
