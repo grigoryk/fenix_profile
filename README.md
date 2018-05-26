@@ -18,4 +18,17 @@ This isn't really a Mentat issue, but I think it makes sense to experiment very 
 ```
 
 ## Fenix?
-I'll be figuring out how to glue this into [Fenix Browser](https://github.com/mozilla-mobile/fenix/) as its storage backend, to act as an initial, realistic test vehicle.
+- I'll be figuring out how to glue this into something like [Fenix Browser](https://github.com/mozilla-mobile/fenix/) as its storage backend, to act as an initial, realistic test vehicle.
+- The goal is to use this from within a mobile app - Android or iOS.
+
+## Why not use mentat directly?
+A lot of the functionality around "profiles" could be - and possibly should be - achieved by interacting directly with mentat via its FFI interface. Examples of that are:
+- defining and evolving schema
+- basic querying
+- transacting
+
+"History" provides an interesting challenge in that its not simply CRUD data - we would like to perform some non-trivial aggregations and querying in order to power something like awesomebar or Top Sites of a browser.
+
+This little project will explore approaches to sharing as much of that work as possible in a common Rust layer, and exposing a sensible API to various mobile consumers (Android and iOS as primary targets).
+
+Additionally, we'd like our awesomebar queries and Top Sites to be fast, which likely means caching, likely at a level beyond what mentat intends to support. This implies a caching indirection at the library level.
