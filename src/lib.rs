@@ -19,12 +19,22 @@ extern crate mentat_ffi;
 
 extern crate libc;
 
+extern crate chrono;
+
+use chrono::{
+    DateTime,
+    NaiveDateTime,
+    Utc,
+};
+
 use failure::{
     Error,
     err_msg,
 };
 
-use time::Timespec;
+use time::{
+    Timespec,
+};
 
 use libc::{
     time_t,
@@ -72,10 +82,6 @@ use mentat_ffi::utils::strings::{
 mod extern_result;
 use extern_result::ExternResult;
 
-mod utils;
-use utils::ToTypedValue;
-
-
 impl FenixProfile for Store {
     fn initialize(&mut self) -> Result<(), Error> {
         let mut in_progress = self.begin_transaction()?;
@@ -89,7 +95,7 @@ impl FenixProfile for Store {
                 (kw!(:page/url),
                 AttributeBuilder::default()
                     .value_type(ValueType::String)
-                    .unique(Unique::Value)
+                    .unique(Unique::Identity)
                     .index(true)
                     .fulltext(true)
                     .multival(false)
@@ -127,18 +133,31 @@ impl FenixProfile for Store {
         .and(Ok(()))
     }
 
-    fn record_visit(&mut self, url: String, when: Timespec) -> Result<i64, Error> {
+    // The "short and sweet" version, where we let mentat do all of the work.
+    fn record_visit_via_transact(&mut self, url: String, when: DateTime<Utc>) -> Result<i64, Error> {
+        let mut transaction = self.begin_transaction()?;
+        let query = format!(r#"[
+            [:db/add "visitid" :visit/page {{:page/url "{}"}}]
+            [:db/add "visitid" :visit/when #inst "{}"]
+        ]"#, url, when.to_rfc3339());
+        let res = transaction.transact(query)?;
+        transaction.commit()?;
+        Ok(*res.tempids.get("visitid").ok_or_else(|| err_msg("expected 'visitid' in tempids"))?)
+    }
+
+    // The "why is this so long" version, where we make a mistake of doing the work ourselves.
+    fn record_visit_via_builders(&mut self, url: String, when: DateTime<Utc>) -> Result<i64, Error> {
         // Takes a RESERVED lock on the underlying database.
         // We don't want other writers here to affect results of the 'page'
         // lookup, but other readers are fine.
         let mut transaction = self.begin_transaction()?;
 
         // Look up 'page' by 'url', and insert it if necessary.
-        let query = r#"[:find ?eid :where [?eid :page/url ?url]]"#;
+        let query = r#"[:find ?eid :in ?url :where [?eid :page/url ?url]]"#;
         // 'url' will be moved later on into an Arc...
         let args = QueryInputs::with_value_sequence(vec![(var!(?url), url.clone().into())]);
         let rows = transaction.q_once(query, args).into_rel_result()?;
-        
+
         let page_e: TypedValue;
 
         if rows.is_empty() {
@@ -180,25 +199,22 @@ impl FenixProfile for Store {
         let temp_visit_e_name = "visit";
         let temp_visit_e = visit_builder.named_tempid(temp_visit_e_name.into());
         visit_builder.add(temp_visit_e.clone(), visit_page_a, page_e)?;
-        visit_builder.add(temp_visit_e.clone(), visit_when_a, when.to_typed_value())?;
+        visit_builder.add(temp_visit_e.clone(), visit_when_a, TypedValue::Instant(when))?;
 
-        let tempids = transaction.transact_builder(visit_builder)?.tempids;
-        let visit_e = tempids
-            .get(temp_visit_e_name)
-            .ok_or_else(|| err_msg("expected 'visit' in tempids"))?;
-
+        let res = transaction.transact_builder(visit_builder)?;
         transaction.commit()?;
-
-        Ok(*visit_e)
+        Ok(*res.tempids.get(temp_visit_e_name).ok_or_else(|| err_msg("expected 'visit' in tempids"))?)
     }
 }
 
 pub trait FenixProfile {
     fn initialize(&mut self) -> Result<(), Error>;
     // TODO use Url type?
-    fn record_visit(&mut self, url: String, when: Timespec) -> Result<i64, Error>;
+    // TODO just pick one of these.
+    fn record_visit_via_builders(&mut self, url: String, when: DateTime<Utc>) -> Result<i64, Error>;
+    fn record_visit_via_transact(&mut self, url: String, when: DateTime<Utc>) -> Result<i64, Error>;
 }
- 
+
 // TODO
 // TLDR; Should be fine to return entid of a new visit.
 // What to return? We need to maintain a visit reference in the consuming code, so that observations
@@ -214,7 +230,15 @@ pub unsafe extern "C" fn fenix_profile_record_visit(manager: *mut Store, url: *c
     let url = c_char_to_string(url);
     let when = Timespec::new(when as i64, 0);
 
-    match manager.record_visit(url.to_string(), when) {
+    let dt = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(when.sec, 0), Utc);
+
+    // TODO why does code below require type annotations..?
+    // manager
+    //     .record_visit(url.to_string(), dt)
+    //     .map_err(|e| e.into())
+    //     .into()
+
+    match manager.record_visit_via_builders(url.to_string(), dt) {
         Ok(visit_e) => ExternResult {
             err: std::ptr::null(),
             ok: string_to_c_char(visit_e.to_string()),
@@ -224,12 +248,6 @@ pub unsafe extern "C" fn fenix_profile_record_visit(manager: *mut Store, url: *c
             ok: std::ptr::null(),
         }
     }
-
-    // TODO why does code below require type annotations..?
-    // manager
-    //     .record_visit(url.to_string(), when)
-    //     .map_err(|e| e.into())
-    //     .into()
 }
 
 #[cfg(test)]
@@ -239,44 +257,74 @@ pub mod tests {
     use mentat::QueryBuilder;
 
     fn get_initialized_store() -> Store {
-        let mut db = Store::open("test.db").expect("in-memory store");
+        let mut db = Store::open("").expect("in-memory store");
         db.initialize().expect("ran initialization");
         db
     }
 
-    // TODO This looks terrible :(
+    // TODO These getters look terrible :(
     fn get_all_page_urls(db: &mut Store) -> Vec<TypedValue> {
         QueryBuilder::new(db, r#"[:find ?url :where [?e :page/url ?url]]"#)
             .execute_rel().expect("execute")
-            .into_iter()
-            .map(|row| row.get(0).expect("").clone().val().expect("typedvalue")).collect()
+            .into_iter().map(|row| row.get(0).expect("").clone().val().expect("typedvalue")).collect()
+    }
+
+    fn get_all_visits(db: &mut Store) -> Vec<TypedValue> {
+        QueryBuilder::new(db, r#"[:find ?e :where [?e :visit/page ?page]]"#)
+            .execute_rel().expect("execute")
+            .into_iter().map(|row| row.get(0).expect("").clone().val().expect("typedvalue")).collect()
+    }
+
+    fn get_all_visits_for_page(db: &mut Store, url: String) -> Vec<TypedValue> {
+        QueryBuilder::new(db, format!(r#"[:find ?e :where [?page :page/url "{}"][?e :visit/page ?page]]"#, url))
+            .execute_rel().expect("execute")
+            .into_iter().map(|row| row.get(0).expect("").clone().val().expect("typedvalue")).collect()
+    }
+
+    fn timestamp(t: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(t, 0), Utc)
     }
 
     #[test]
     fn test_initialization() {
-        get_initialized_store();
+        let _db = get_initialized_store();
     }
 
     #[test]
-    fn test_record_visit() {
+    fn test_pages_are_a_set() {
         let mut db = get_initialized_store();
-
         assert_eq!(0, get_all_page_urls(&mut db).len());
 
-        db.record_visit("https://www.mozilla.org".to_string(), Timespec::new(1, 0)).expect("recorded visit");
+        db.record_visit_via_transact("https://www.mozilla.org".to_string(), timestamp(1)).expect("recorded visit");
 
         // TODO this is also terrible...
         let urls = get_all_page_urls(&mut db);
         assert_eq!(urls, vec![TypedValue::String(Arc::new("https://www.mozilla.org".to_string()))]);
 
-        db.record_visit("https://www.mozilla.org".to_string(), Timespec::new(2, 0)).expect("recorded visit");
+        db.record_visit_via_transact("https://www.mozilla.org".to_string(), timestamp(2)).expect("recorded visit");
         assert_eq!(1, get_all_page_urls(&mut db).len());
 
-        db.record_visit("https://www.example.org".to_string(), Timespec::new(3, 0)).expect("recorded visit");
+        db.record_visit_via_transact("https://www.example.org".to_string(), timestamp(3)).expect("recorded visit");
         let urls = get_all_page_urls(&mut db);
         assert_eq!(urls, vec![
             TypedValue::String(Arc::new("https://www.mozilla.org".to_string())),
             TypedValue::String(Arc::new("https://www.example.org".to_string())),
         ]);
+    }
+
+    #[test]
+    fn test_visits_are_recorded() {
+        let mut db = get_initialized_store();
+        assert_eq!(0, get_all_visits(&mut db).len());
+
+        db.record_visit_via_builders("https://www.mozilla.org".to_string(), timestamp(1)).expect("recorded visit");
+        assert_eq!(1, get_all_visits(&mut db).len());
+        assert_eq!(1, get_all_visits_for_page(&mut db, "https://www.mozilla.org".to_string()).len());
+        assert_eq!(0, get_all_visits_for_page(&mut db, "https://www.example.org".to_string()).len());
+
+        db.record_visit_via_builders("https://www.example.org".to_string(), timestamp(2)).expect("recorded visit");
+        db.record_visit_via_builders("https://www.example.org".to_string(), timestamp(3)).expect("recorded visit");
+        assert_eq!(1, get_all_visits_for_page(&mut db, "https://www.mozilla.org".to_string()).len());
+        assert_eq!(2, get_all_visits_for_page(&mut db, "https://www.example.org".to_string()).len());
     }
 }
